@@ -18,6 +18,36 @@ trait CustomHandler<T, S, Err>: Send + Sized + 'static {
     fn call_me(self, req: Request, state: S) -> Self::Future;
 }
 
+impl<F, Fut, Res, S, Err> CustomHandler<((),), S, Err> for F
+where
+    F: FnOnce() -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Res, Err>> + Send,
+    Res: IntoResponse,
+    Err: Send + Sync + std::error::Error + 'static,
+{
+    type Future = Pin<Box<dyn Future<Output = Result<Response, Err>> + Send>>;
+
+    fn call_me(self, _req: Request, _state: S) -> Self::Future {
+        Box::pin(async move {
+            let res = self().await.map_err(|e| {
+                ////////////////////////////////
+                // ERROR TRACING HAPPENS HERE //
+                ////////////////////////////////
+                tracing::error!(
+                    error.message = %e,
+                    error.details = ?e,
+                    "An error occurred during request handling"
+                );
+                e
+            })?;
+
+            Ok(res.into_response())
+        })
+    }
+}
+
+
+
 macro_rules! all_the_tuples {
     ($name:ident) => {
         $name!([], T1);

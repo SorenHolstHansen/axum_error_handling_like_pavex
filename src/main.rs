@@ -11,6 +11,7 @@ use tower_http::trace::TraceLayer;
 use tracing::Span;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+// SETUP
 trait CustomHandler<T, S, Err>: Send + Sized + 'static {
     type Future: Future<Output = Result<Response, Err>> + Send + 'static;
 
@@ -84,6 +85,9 @@ macro_rules! impl_handler {
                     };
 
                     let res = self($($ty,)* $last,).await.map_err(|e| {
+                        ////////////////////////////////
+                        // ERROR TRACING HAPPENS HERE //
+                        ////////////////////////////////
                         tracing::error!(
                             error.message = %e,
                             error.details = ?e,

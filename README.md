@@ -1,4 +1,4 @@
-# Axun error handling like Pavex
+# Axum error handling like Pavex
 
 This is a simple PoC for how to do error handling, and in particular tracing, like in Pavex.
 

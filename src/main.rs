@@ -1,9 +1,9 @@
 use axum::{
-    error_handling::HandleError,
     extract::{FromRequest, FromRequestParts, Request},
+    handler::Handler,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get_service,
+    routing::get,
     Router,
 };
 use std::{fmt::Display, future::Future, pin::Pin, time::Duration};
@@ -11,10 +11,92 @@ use tower_http::trace::TraceLayer;
 use tracing::Span;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-trait CustomHandler<T, S, Err>: Send + Sized + 'static {
-    type Future: Future<Output = Result<Response, Err>> + Send + 'static;
+fn trace_error<E: std::error::Error>(e: &E) {
+    tracing::error!(
+        error.message = %e,
+        error.details = ?e,
+        "An error occurred during request handling"
+    );
+}
 
-    fn call_me(self, req: Request, state: S) -> Self::Future;
+#[derive(Clone)]
+pub struct ErrorHandledHandler<F, FE>(pub F, pub FE);
+
+impl<F, FE, FFut, FEFut, FOk, FErr, FERes, S> Handler<((),), S> for ErrorHandledHandler<F, FE>
+where
+    F: FnOnce() -> FFut + Clone + Send + 'static,
+    FE: FnOnce(FErr) -> FEFut + Clone + Send + 'static,
+    FFut: Future<Output = Result<FOk, FErr>> + Send,
+    FEFut: Future<Output = FERes> + Send,
+    FOk: IntoResponse + Send,
+    FERes: IntoResponse,
+    FErr: std::error::Error + Send,
+{
+    type Future = Pin<Box<dyn Future<Output = Response> + Send>>;
+
+    fn call(self, _req: Request, _state: S) -> Self::Future {
+        Box::pin(async move {
+            match self.0().await {
+                Ok(value) => value.into_response(),
+                Err(e) => {
+                    trace_error(&e);
+                    self.1(e).await.into_response()
+                }
+            }
+        })
+    }
+}
+
+macro_rules! impl_handler {
+    (
+        [$($ty:ident),*], $last:ident
+    ) => {
+        #[allow(non_snake_case, unused_mut)]
+        impl<F, FE, FFut, FEFut, FOk, FErr, FERes, S, M, $($ty,)* $last> Handler<(M, $($ty,)* $last,), S> for ErrorHandledHandler<F, FE>
+        where
+            F: FnOnce($($ty,)* $last,) -> FFut + Clone + Send + 'static,
+            FE: FnOnce(FErr) -> FEFut + Clone + Send + 'static,
+            FFut: Future<Output = Result<FOk, FErr>> + Send,
+            FEFut: Future<Output = FERes> + Send,
+            FOk: IntoResponse + Send,
+            S: Send + Sync + 'static,
+            FERes: IntoResponse,
+            FErr: std::error::Error + Send,
+            $( $ty: FromRequestParts<S> + Send, )*
+            $last: FromRequest<S, M> + Send,
+        {
+            type Future = Pin<Box<dyn Future<Output = Response> + Send>>;
+
+            fn call(self, req: Request, state: S) -> Self::Future {
+                Box::pin(async move {
+                    let (mut parts, body) = req.into_parts();
+                    let state = &state;
+
+                    $(
+                        let $ty = match $ty::from_request_parts(&mut parts, state).await {
+                            Ok(value) => value,
+                            Err(rejection) => return rejection.into_response(),
+                        };
+                    )*
+
+                    let req = Request::from_parts(parts, body);
+
+                    let $last = match $last::from_request(req, state).await {
+                        Ok(value) => value,
+                        Err(rejection) => return rejection.into_response(),
+                    };
+
+                    match self.0($($ty,)* $last,).await {
+                        Ok(value) => value.into_response(),
+                        Err(e) => {
+                            trace_error(&e);
+                            self.1(e).await.into_response()
+                        }
+                    }
+                })
+            }
+        }
+    };
 }
 
 macro_rules! all_the_tuples {
@@ -47,68 +129,7 @@ macro_rules! all_the_tuples {
     };
 }
 
-macro_rules! impl_handler {
-    (
-        [$($ty:ident),*], $last:ident
-    ) => {
-        #[allow(non_snake_case, unused_mut)]
-        impl<F, Fut, Res, S, Err, M, $($ty,)* $last> CustomHandler<(M, $($ty,)* $last,), S, Err> for F
-        where
-            F: FnOnce($($ty,)* $last,) -> Fut + Send + 'static,
-            Fut: Future<Output = Result<Res, Err>> + Send,
-            Res: IntoResponse,
-            Err: Send + Sync + std::error::Error + 'static,
-            S: Send + Sync + 'static,
-            $( $ty: FromRequestParts<S> + Send, )*
-            $last: FromRequest<S, M> + Send,
-        {
-            type Future = Pin<Box<dyn Future<Output = Result<Response, Err>> + Send>>;
-
-            fn call_me(self, req: Request, state: S) -> Self::Future {
-                Box::pin(async move {
-                    let (mut parts, body) = req.into_parts();
-                    let state = &state;
-
-                    $(
-                        let $ty = match $ty::from_request_parts(&mut parts, state).await {
-                            Ok(value) => value,
-                            Err(rejection) => return Ok(rejection.into_response()),
-                        };
-                    )*
-
-                    let req = Request::from_parts(parts, body);
-
-                    let $last = match $last::from_request(req, state).await {
-                        Ok(value) => value,
-                        Err(rejection) => return Ok(rejection.into_response()),
-                    };
-
-                    let res = self($($ty,)* $last,).await.map_err(|e| {
-                        tracing::error!(
-                            error.message = %e,
-                            error.details = ?e,
-                            "An error occurred during request handling"
-                        );
-                        e
-                    })?;
-
-                    Ok(res.into_response())
-                })
-            }
-        }
-    };
-}
-
 all_the_tuples!(impl_handler);
-
-macro_rules! handled_service {
-    ($f:ident, $ef:ident) => {
-        HandleError::new(
-            tower::service_fn(move |req: Request| async { Ok($f.call_me(req, ()).await?) }),
-            $ef,
-        )
-    };
-}
 
 #[derive(Debug)]
 struct MyErr;
@@ -126,8 +147,8 @@ async fn handler(_header: HeaderMap, _req: Request) -> Result<StatusCode, MyErr>
     Err(MyErr)
 }
 
-/// Can also do arbitrary extractors here
-async fn handle_error(_header: HeaderMap, _err: MyErr) -> StatusCode {
+/// Could also allow extractors here if we implement the trait
+async fn handle_error(_err: MyErr) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
@@ -143,7 +164,7 @@ async fn main() {
         .init();
 
     let app = Router::new()
-        .route("/", get_service(handled_service!(handler, handle_error)))
+        .route("/", get(ErrorHandledHandler(handler, handle_error)))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<_>| {
